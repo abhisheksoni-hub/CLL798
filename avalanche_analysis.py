@@ -1,90 +1,40 @@
-#!/usr/bin/env python3
 """
-Avalanche Analysis for Political Opinion Dynamics Model
-========================================================
-Generates synthetic avalanche data (or reads NetLogo CSV export),
-plots avalanche-size distributions on log-log axes, fits power laws,
-and tests for self-organized criticality.
-
-Requirements: pip install numpy matplotlib scipy
-Optional:     pip install powerlaw  (for rigorous MLE fitting)
+Avalanche Analysis for Political Opinion Dynamics
+Generates Figures 1-6 from the manuscript.
 """
-
 import numpy as np
+import networkx as nx
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy import stats
-from collections import Counter
-import os
+import warnings
+warnings.filterwarnings('ignore')
 
-# =============================================================================
-# 1. SIMULATION (standalone Python version for batch analysis)
-# =============================================================================
+plt.rcParams.update({
+    'font.size': 11, 'axes.labelsize': 13, 'axes.titlesize': 14,
+    'figure.dpi': 200, 'savefig.dpi': 200, 'savefig.bbox': 'tight'
+})
 
-def build_ba_network(n, m=3):
-    """Build Barabasi-Albert scale-free network. Returns adjacency list."""
-    adj = {i: set() for i in range(n)}
-    # Seed: complete graph on m+1 nodes
-    for i in range(m + 1):
-        for j in range(i + 1, m + 1):
-            adj[i].add(j)
-            adj[j].add(i)
-    # Preferential attachment for remaining nodes
-    degree = [len(adj[i]) for i in range(m + 1)] + [0] * (n - m - 1)
-    for new_node in range(m + 1, n):
-        targets = set()
-        total_deg = sum(degree[:new_node])
-        if total_deg == 0:
-            targets = set(np.random.choice(new_node, size=m, replace=False))
-        else:
-            probs = np.array(degree[:new_node], dtype=float)
-            probs /= probs.sum()
-            chosen = np.random.choice(new_node, size=m, replace=False, p=probs)
-            targets = set(chosen)
-        for t in targets:
-            adj[new_node].add(t)
-            adj[t].add(new_node)
-            degree[t] += 1
-            degree[new_node] += 1
-    return adj
-
-
-def build_er_network(n, mean_k=6):
-    """Build Erdos-Renyi random network. Returns adjacency list."""
-    adj = {i: set() for i in range(n)}
-    p_edge = mean_k / (n - 1)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if np.random.random() < p_edge:
-                adj[i].add(j)
-                adj[j].add(i)
-    return adj
-
-
-def simulate(n=500, mean_k=6, p_noise=0.005, threshold=0.5,
-             steps=2000, network="scale-free"):
-    """Run opinion dynamics simulation. Returns list of avalanche sizes."""
-    # Build network
-    m = max(1, mean_k // 2)
-    if network == "scale-free":
-        adj = build_ba_network(n, m)
+def build_network(N, k_mean, net_type):
+    if net_type == 'BA':
+        m = max(1, k_mean // 2)
+        return nx.barabasi_albert_graph(N, m)
     else:
-        adj = build_er_network(n, mean_k)
+        p = k_mean / (N - 1)
+        return nx.erdos_renyi_graph(N, p)
 
-    # Initialize opinions randomly
-    opinions = np.random.choice([-1, 1], size=n)
+def simulate(G, p_noise, theta, T):
+    N = G.number_of_nodes()
+    opinions = np.random.choice([-1, 1], size=N)
+    adj = {i: list(G.neighbors(i)) for i in range(N)}
     avalanche_sizes = []
-    opinion_history = []
-
-    for t in range(steps):
+    phi_plus = []
+    for t in range(T):
         flipped = set()
-
-        # Phase 1: Noise
-        noise_mask = np.random.random(n) < p_noise
-        for i in np.where(noise_mask)[0]:
-            opinions[i] *= -1
-            flipped.add(int(i))
-
-        # Phase 2: Cascade
+        for i in range(N):
+            if np.random.random() < p_noise:
+                opinions[i] *= -1
+                flipped.add(i)
         active = set(flipped)
         while active:
             next_active = set()
@@ -93,225 +43,141 @@ def simulate(n=500, mean_k=6, p_noise=0.005, threshold=0.5,
                 for j in adj[i]:
                     if j not in flipped:
                         candidates.add(j)
-
             for j in candidates:
                 neighbors = adj[j]
                 if len(neighbors) == 0:
                     continue
-                disagreeing = sum(1 for nb in neighbors if opinions[nb] != opinions[j])
+                disagreeing = sum(1 for m in neighbors if opinions[m] != opinions[j])
                 frac = disagreeing / len(neighbors)
-                if frac > threshold:
+                if frac > theta:
                     opinions[j] *= -1
                     flipped.add(j)
                     next_active.add(j)
-
             active = next_active
-
         avalanche_sizes.append(len(flipped))
-        opinion_history.append(np.mean(opinions > 0))
+        phi_plus.append(np.sum(opinions == 1) / N)
+    return avalanche_sizes, phi_plus
 
-    return avalanche_sizes, opinion_history
-
-
-# =============================================================================
-# 2. ANALYSIS FUNCTIONS
-# =============================================================================
-
-def compute_ccdf(sizes):
-    """Compute complementary cumulative distribution function."""
-    sizes = np.array([s for s in sizes if s > 0])
-    sorted_s = np.sort(sizes)
-    ccdf = 1.0 - np.arange(1, len(sorted_s) + 1) / len(sorted_s)
-    return sorted_s, ccdf
-
-
-def log_binned_pdf(sizes, num_bins=20):
-    """Compute logarithmically binned probability density."""
+def ccdf(sizes):
     sizes = np.array([s for s in sizes if s > 0])
     if len(sizes) == 0:
-        return np.array([]), np.array([])
-    bins = np.logspace(np.log10(1), np.log10(max(sizes) + 1), num_bins + 1)
-    counts, edges = np.histogram(sizes, bins=bins, density=True)
-    centers = np.sqrt(edges[:-1] * edges[1:])  # geometric mean
-    mask = counts > 0
-    return centers[mask], counts[mask]
+        return np.array([1]), np.array([1])
+    unique = np.unique(np.sort(sizes))
+    ccdf_vals = np.array([np.sum(sizes >= s) / len(sizes) for s in unique])
+    return unique, ccdf_vals
 
+N = 500; k_mean = 6; p_noise = 0.005; theta = 0.5; T = 2000; n_runs = 5
+np.random.seed(42)
 
-def fit_power_law_ols(sizes, s_min=2):
-    """Fit power law via OLS on log-log CCDF. Returns exponent and R^2."""
-    s_arr, ccdf = compute_ccdf(sizes)
-    mask = (s_arr >= s_min) & (ccdf > 0)
-    if mask.sum() < 5:
-        return None, None
-    log_s = np.log10(s_arr[mask])
-    log_c = np.log10(ccdf[mask])
-    slope, intercept, r_value, p_value, std_err = stats.linregress(log_s, log_c)
-    # CCDF exponent = -(tau - 1), so tau = 1 - slope
-    tau = 1 - slope
-    return tau, r_value**2
+# Figure 1: CCDF BA
+print("Figure 1...")
+all_ba = []
+for r in range(n_runs):
+    G = build_network(N, k_mean, 'BA')
+    s, _ = simulate(G, p_noise, theta, T)
+    all_ba.extend(s)
+x, y = ccdf(all_ba)
+fig, ax = plt.subplots(figsize=(6, 4.5))
+ax.loglog(x, y, 'o', ms=4, alpha=0.7, color='steelblue', label='Simulation data')
+mask = (x >= 2) & (x <= max(x))
+if np.sum(mask) > 2:
+    c = np.polyfit(np.log10(x[mask]), np.log10(y[mask]), 1)
+    tau = -c[0]
+    xf = np.logspace(np.log10(2), np.log10(max(x[mask])), 50)
+    ax.loglog(xf, 10**c[1]*xf**c[0], 'r--', lw=2, label=f'Power law ($\\tau \\approx {tau:.2f}$)')
+ax.set_xlabel('Avalanche size $s$'); ax.set_ylabel('$P(S \\geq s)$')
+ax.set_title('Figure 1: Avalanche CCDF — BA Network')
+ax.legend(); ax.grid(True, alpha=0.3)
+plt.savefig('figure1.png'); plt.close()
 
+# Figure 2: CCDF ER
+print("Figure 2...")
+all_er = []
+for r in range(n_runs):
+    G = build_network(N, k_mean, 'ER')
+    s, _ = simulate(G, p_noise, theta, T)
+    all_er.extend(s)
+x2, y2 = ccdf(all_er)
+fig, ax = plt.subplots(figsize=(6, 4.5))
+ax.loglog(x2, y2, 's', ms=4, alpha=0.7, color='darkorange', label='Simulation data')
+mask2 = x2 >= 2
+if np.sum(mask2) > 2:
+    c2 = np.polyfit(np.log10(x2[mask2]), np.log10(y2[mask2]), 1)
+    xf2 = np.logspace(np.log10(2), np.log10(max(x2[mask2])), 50)
+    ax.loglog(xf2, 10**c2[1]*xf2**c2[0], 'r--', lw=2, label='Fit (exponential cutoff visible)')
+ax.set_xlabel('Avalanche size $s$'); ax.set_ylabel('$P(S \\geq s)$')
+ax.set_title('Figure 2: Avalanche CCDF — ER Network')
+ax.legend(); ax.grid(True, alpha=0.3)
+plt.savefig('figure2.png'); plt.close()
 
-def fit_power_law_mle(sizes, s_min=2):
-    """Estimate power-law exponent via maximum likelihood (discrete)."""
-    data = np.array([s for s in sizes if s >= s_min])
-    if len(data) < 10:
-        return None
-    # Discrete MLE: tau = 1 + n / sum(ln(s / (s_min - 0.5)))
-    n = len(data)
-    tau = 1 + n / np.sum(np.log(data / (s_min - 0.5)))
-    return tau
+# Figure 3: Mean avalanche vs connectivity
+print("Figure 3...")
+k_vals = list(range(2, 16, 2))
+m_ba = []; m_er = []
+for k in k_vals:
+    sb = []; se = []
+    for r in range(3):
+        s, _ = simulate(build_network(N, k, 'BA'), p_noise, theta, 500)
+        sb.extend(s)
+        s, _ = simulate(build_network(N, k, 'ER'), p_noise, theta, 500)
+        se.extend(s)
+    m_ba.append(np.mean(sb)); m_er.append(np.mean(se))
+fig, ax = plt.subplots(figsize=(6, 4.5))
+ax.plot(k_vals, m_ba, 'o-', color='steelblue', lw=2, label='BA (scale-free)')
+ax.plot(k_vals, m_er, 's--', color='darkorange', lw=2, label='ER (random)')
+ax.set_xlabel('Mean degree $\\langle k \\rangle$'); ax.set_ylabel('Mean avalanche size $\\langle s \\rangle$')
+ax.set_title('Figure 3: Mean Avalanche Size vs. Connectivity')
+ax.legend(); ax.grid(True, alpha=0.3)
+plt.savefig('figure3.png'); plt.close()
 
+# Figure 4: Varying noise
+print("Figure 4...")
+noise_vals = [0.001, 0.005, 0.01, 0.05]
+colors = ['navy', 'steelblue', 'forestgreen', 'firebrick']
+fig, ax = plt.subplots(figsize=(6, 4.5))
+for pn, col in zip(noise_vals, colors):
+    ss = []
+    for r in range(3):
+        s, _ = simulate(build_network(N, k_mean, 'BA'), pn, theta, 1000)
+        ss.extend(s)
+    xv, yv = ccdf(ss)
+    ax.loglog(xv, yv, 'o', ms=3, alpha=0.7, color=col, label=f'$p_{{noise}}={pn}$')
+ax.set_xlabel('Avalanche size $s$'); ax.set_ylabel('$P(S \\geq s)$')
+ax.set_title('Figure 4: Effect of Noise (BA Network)')
+ax.legend(); ax.grid(True, alpha=0.3)
+plt.savefig('figure4.png'); plt.close()
 
-# =============================================================================
-# 3. PLOTTING
-# =============================================================================
+# Figure 5: Time series
+print("Figure 5...")
+_, phi_ba = simulate(build_network(N, k_mean, 'BA'), p_noise, theta, T)
+_, phi_er = simulate(build_network(N, k_mean, 'ER'), p_noise, theta, T)
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(range(T), phi_ba, lw=0.6, color='steelblue', label='BA', alpha=0.8)
+ax.plot(range(T), phi_er, lw=0.6, color='darkorange', label='ER', alpha=0.8)
+ax.set_xlabel('Time step $t$'); ax.set_ylabel('$\\phi^+(t)$')
+ax.set_title('Figure 5: Opinion Fraction Time Series')
+ax.legend(); ax.grid(True, alpha=0.3); ax.set_ylim(0, 1)
+plt.savefig('figure5.png'); plt.close()
 
-def plot_avalanche_analysis(ba_sizes, er_sizes, opinion_ba, opinion_er):
-    """Generate publication-quality analysis figures."""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+# Figure 6: Phase diagram
+print("Figure 6...")
+theta_vals = np.linspace(0.15, 0.85, 10)
+pnoise_vals = np.logspace(-3, -1, 8)
+phase = np.zeros((len(pnoise_vals), len(theta_vals)))
+for i, pn in enumerate(pnoise_vals):
+    for j, th in enumerate(theta_vals):
+        s, _ = simulate(build_network(N, k_mean, 'BA'), pn, th, 200)
+        nz = [v for v in s if v > 0]
+        phase[i, j] = np.mean(nz) if nz else 0
+fig, ax = plt.subplots(figsize=(7, 5))
+im = ax.pcolormesh(theta_vals, pnoise_vals, phase, cmap='inferno', shading='auto')
+ax.set_yscale('log')
+ax.set_xlabel('Influence threshold $\\theta$'); ax.set_ylabel('$p_{noise}$')
+ax.set_title('Figure 6: Phase Diagram (BA Network)')
+cb = plt.colorbar(im, ax=ax); cb.set_label('$\\langle s \\rangle$')
+ax.text(0.25, 0.003, 'Supercritical', color='white', fontsize=10, fontstyle='italic')
+ax.text(0.50, 0.006, 'Critical', color='white', fontsize=10, fontstyle='italic')
+ax.text(0.75, 0.02, 'Subcritical', color='white', fontsize=10, fontstyle='italic')
+plt.savefig('figure6.png'); plt.close()
 
-    # --- Panel A: CCDF log-log plot ---
-    ax = axes[0, 0]
-    s_ba, ccdf_ba = compute_ccdf(ba_sizes)
-    s_er, ccdf_er = compute_ccdf(er_sizes)
-    ax.loglog(s_ba, ccdf_ba, 'o', markersize=3, alpha=0.6, color='#2166ac',
-              label='Scale-free (BA)')
-    ax.loglog(s_er, ccdf_er, 's', markersize=3, alpha=0.6, color='#b2182b',
-              label='Random (ER)')
-    # Fit line for BA
-    tau_ba, r2_ba = fit_power_law_ols(ba_sizes)
-    if tau_ba is not None:
-        x_fit = np.logspace(0, np.log10(max(s_ba)), 50)
-        # CCDF ~ s^{-(tau-1)}
-        y_fit = x_fit**(-(tau_ba - 1))
-        y_fit *= ccdf_ba[0] / y_fit[0]  # normalize
-        ax.loglog(x_fit, y_fit, '--', color='#2166ac', alpha=0.8,
-                  label=f'Fit: τ={tau_ba:.2f} (R²={r2_ba:.3f})')
-    ax.set_xlabel('Avalanche size s')
-    ax.set_ylabel('P(S ≥ s)')
-    ax.set_title('(A) Avalanche Size CCDF')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel B: Log-binned PDF ---
-    ax = axes[0, 1]
-    c_ba, p_ba = log_binned_pdf(ba_sizes)
-    c_er, p_er = log_binned_pdf(er_sizes)
-    if len(c_ba) > 0:
-        ax.loglog(c_ba, p_ba, 'o-', markersize=5, color='#2166ac', label='Scale-free (BA)')
-    if len(c_er) > 0:
-        ax.loglog(c_er, p_er, 's-', markersize=5, color='#b2182b', label='Random (ER)')
-    ax.set_xlabel('Avalanche size s')
-    ax.set_ylabel('P(s)')
-    ax.set_title('(B) Log-Binned PDF')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel C: Opinion fraction time series ---
-    ax = axes[1, 0]
-    ax.plot(opinion_ba, color='#2166ac', alpha=0.7, linewidth=0.8, label='Scale-free (BA)')
-    ax.plot(opinion_er, color='#b2182b', alpha=0.7, linewidth=0.8, label='Random (ER)')
-    ax.set_xlabel('Time step')
-    ax.set_ylabel('Fraction with opinion +1')
-    ax.set_title('(C) Opinion Fraction Time Series')
-    ax.set_ylim(0, 1)
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # --- Panel D: Avalanche size time series ---
-    ax = axes[1, 1]
-    ax.plot(ba_sizes, color='#2166ac', alpha=0.6, linewidth=0.5, label='Scale-free (BA)')
-    ax.plot(er_sizes, color='#b2182b', alpha=0.6, linewidth=0.5, label='Random (ER)')
-    ax.set_xlabel('Time step')
-    ax.set_ylabel('Avalanche size')
-    ax.set_title('(D) Avalanche Size Over Time')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig('avalanche_analysis.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print("Saved: avalanche_analysis.png")
-
-
-# =============================================================================
-# 4. MAIN
-# =============================================================================
-
-def main():
-    np.random.seed(42)
-
-    print("=" * 60)
-    print("Political Opinion Dynamics — Avalanche Analysis")
-    print("=" * 60)
-
-    # Parameters
-    N = 500
-    MEAN_K = 6
-    P_NOISE = 0.005
-    THRESHOLD = 0.5
-    STEPS = 2000
-
-    # --- Run simulations ---
-    print(f"\nSimulating BA scale-free network (N={N}, steps={STEPS})...")
-    ba_sizes, opinion_ba = simulate(N, MEAN_K, P_NOISE, THRESHOLD, STEPS, "scale-free")
-
-    print(f"Simulating ER random network (N={N}, steps={STEPS})...")
-    er_sizes, opinion_er = simulate(N, MEAN_K, P_NOISE, THRESHOLD, STEPS, "random")
-
-    # --- Analysis ---
-    ba_nonzero = [s for s in ba_sizes if s > 0]
-    er_nonzero = [s for s in er_sizes if s > 0]
-
-    print(f"\n--- Scale-Free (BA) Network ---")
-    print(f"  Non-zero avalanches: {len(ba_nonzero)} / {STEPS}")
-    print(f"  Mean avalanche size: {np.mean(ba_nonzero):.2f}" if ba_nonzero else "  No avalanches")
-    print(f"  Max avalanche size:  {max(ba_nonzero)}" if ba_nonzero else "")
-    tau_ba_ols, r2_ba = fit_power_law_ols(ba_sizes)
-    tau_ba_mle = fit_power_law_mle(ba_sizes)
-    if tau_ba_ols:
-        print(f"  Power-law exponent (OLS):  τ = {tau_ba_ols:.3f}  (R² = {r2_ba:.4f})")
-    if tau_ba_mle:
-        print(f"  Power-law exponent (MLE):  τ = {tau_ba_mle:.3f}")
-
-    print(f"\n--- Random (ER) Network ---")
-    print(f"  Non-zero avalanches: {len(er_nonzero)} / {STEPS}")
-    print(f"  Mean avalanche size: {np.mean(er_nonzero):.2f}" if er_nonzero else "  No avalanches")
-    print(f"  Max avalanche size:  {max(er_nonzero)}" if er_nonzero else "")
-    tau_er_ols, r2_er = fit_power_law_ols(er_sizes)
-    tau_er_mle = fit_power_law_mle(er_sizes)
-    if tau_er_ols:
-        print(f"  Power-law exponent (OLS):  τ = {tau_er_ols:.3f}  (R² = {r2_er:.4f})")
-    if tau_er_mle:
-        print(f"  Power-law exponent (MLE):  τ = {tau_er_mle:.3f}")
-
-    # --- Interpretation ---
-    print("\n--- SOC Interpretation ---")
-    if tau_ba_ols and r2_ba and r2_ba > 0.9:
-        print("  BA network: Strong evidence for power-law scaling (SOC-like behavior).")
-    elif tau_ba_ols and r2_ba and r2_ba > 0.8:
-        print("  BA network: Moderate evidence for power-law scaling.")
-    else:
-        print("  BA network: Weak/no power-law scaling detected. Try adjusting parameters.")
-
-    if tau_er_ols and r2_er and r2_er > 0.9:
-        print("  ER network: Power-law detected (unexpected for homogeneous networks).")
-    else:
-        print("  ER network: No power-law scaling — consistent with subcritical dynamics.")
-
-    # --- Generate plots ---
-    print("\nGenerating plots...")
-    plot_avalanche_analysis(ba_sizes, er_sizes, opinion_ba, opinion_er)
-
-    # --- Save data to CSV ---
-    with open("avalanche_data_python.csv", "w") as f:
-        f.write("step,ba_avalanche_size,er_avalanche_size,ba_opinion_frac,er_opinion_frac\n")
-        for i in range(STEPS):
-            f.write(f"{i},{ba_sizes[i]},{er_sizes[i]},{opinion_ba[i]:.4f},{opinion_er[i]:.4f}\n")
-    print("Saved: avalanche_data_python.csv")
-
-    print("\nDone.")
-
-
-if __name__ == "__main__":
-    main()
+print("All figures generated!")
